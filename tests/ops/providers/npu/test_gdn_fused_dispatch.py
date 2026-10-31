@@ -1,8 +1,8 @@
 """Adaptive GDN dispatch tests: probe quadrants drive the wrapper decision.
 
-These tests mock the ``fused_fwd_usable`` / ``fused_bwd_usable`` probes (both
-``lru_cache``-wrapped) to cover the dispatch quadrants without running any
-real fused kernel:
+These tests mock the ``fused_fwd_usable`` / ``fused_bwd_usable`` probes (thin
+readers of one lru_cached `_probe_fused_pair` result) to cover the dispatch
+quadrants without running any real fused kernel:
 
 * both probes true     -> AdaptiveFunction with fused_backward=True
 * fwd true, bwd false  -> AdaptiveFunction with fused_backward=False
@@ -57,12 +57,17 @@ class _Recorder:
 
 @pytest.fixture
 def clean_probe_cache():
-    """Clear the lru_cache on both probes around every test."""
-    fused_mod.fused_fwd_usable.cache_clear()
-    fused_mod.fused_bwd_usable.cache_clear()
+    """Clear the shared probe cache around every test.
+
+    ``fused_fwd_usable`` / ``fused_bwd_usable`` read one lru_cached
+    `_probe_fused_pair` result, so clearing that single cache resets both.
+    Tests monkeypatching the probes on ``gdn_pkg`` bypass it entirely (the
+    wrapper calls the patched callables), but tests exercising the real
+    ``fused_mod`` functions need the reset to be order-independent.
+    """
+    fused_mod._probe_fused_pair.cache_clear()
     yield
-    fused_mod.fused_fwd_usable.cache_clear()
-    fused_mod.fused_bwd_usable.cache_clear()
+    fused_mod._probe_fused_pair.cache_clear()
 
 
 def _run_wrapper(monkeypatch, tensors, use_fused=True, **extra):

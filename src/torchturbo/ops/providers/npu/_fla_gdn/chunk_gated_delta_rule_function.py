@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import inspect
 import math
+from functools import lru_cache
 from typing import Dict, Optional
 
 import torch
@@ -50,6 +51,7 @@ from fla_npu.ops.ascendc import (
 from fla_npu.ops.triton import chunk_local_cumsum
 
 
+@lru_cache(maxsize=1)
 def _fwd_h_kwargs() -> dict:
     """Version-adaptive kwargs for npu_chunk_gated_delta_rule_fwd_h.
 
@@ -70,6 +72,10 @@ def _fwd_h_kwargs() -> dict:
     The chain always needs v_new, so the 26.6.0 spelling maps to
     save_new_value=True (its default), exactly the 26.9.1
     state_v_first=False semantics.
+
+    The result is constant for a given install, so it is probed once per
+    process and cached (the probe runs on the first chain call, not at
+    import, keeping the module importable off-device).
     """
     import torch
 
@@ -81,9 +87,17 @@ def _fwd_h_kwargs() -> dict:
     if "state_v_first" not in params:
         # Opaque pass-through wrapper (26.6.0): fall back to the torch op
         # schema, which only exists there because 26.6.0's extension is what
-        # registers the op under torch.ops.npu.
-        schema = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h.default._schema
-        params = {arg.name for arg in schema.arguments}
+        # registers the op under torch.ops.npu. An installation with an
+        # opaque wrapper but the op registered elsewhere (e.g. a future
+        # stable-ABI-only generation) has no torch.ops.npu entry, and
+        # that lookup raises AttributeError -- treat it the same as an
+        # unresolvable signature and let the generation known to be opaque
+        # decide, instead of crashing mid-training.
+        try:
+            schema = torch.ops.npu.npu_chunk_gated_delta_rule_fwd_h.default._schema
+            params = {arg.name for arg in schema.arguments}
+        except AttributeError:
+            params = frozenset()
     if "state_v_first" in params:
         return {"state_v_first": False}
     return {

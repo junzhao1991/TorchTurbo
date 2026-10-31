@@ -62,18 +62,22 @@ __all__ = [
 # six-operator chain even inside the fused envelope (K=V=128, chunk=64).
 _USE_FUSED_GDN = bool(int(os.environ.get("TORCHTURBO_GDN_USE_FUSED", "1")))
 
-# The dispatch path is decided once per process (lru_cached probes), so the
-# path warnings must fire once per process too -- not once per GDN call
-# (observed 18480 lines in a real SFT run otherwise).
-_warned: set[str] = set()
+# One TurboLogger instance for this module, created lazily on the first
+# dispatch decision. ``get_logger`` returns a fresh TurboLogger each call and
+# the ``*_rank0_once`` dedup set lives on the instance, so calling it at warn
+# time (as earlier revisions did) re-deduplicated from scratch every GDN call
+# -- an SFT run printed the path warning once per step. Holding the instance
+# here restores once-per-process with the rank-0 filter intact.
+_logger: Optional["TurboLogger"] = None
 
 
-def _warn_once(key: str) -> bool:
-    """True the first time ``key`` is seen in this process; False after."""
-    if key in _warned:
-        return False
-    _warned.add(key)
-    return True
+def _dispatch_logger():
+    global _logger
+    if _logger is None:
+        from torchturbo.logging import get_logger
+
+        _logger = get_logger(__name__)
+    return _logger
 
 
 # Preferred depthwise-conv head dimension. Equals the model's
@@ -227,10 +231,13 @@ def ascendc_chunk_gated_delta_rule(
             # composed four-operator chain runs over the fused forward's
             # exports (it recomputes w/u/h/v_new itself). Falls through to
             # the composed chain entirely when the fused forward is missing.
-            if not bwd_fused and _warn_once("mixed"):
-                from torchturbo.logging import get_logger
-
-                get_logger(__name__).warning(
+            if not bwd_fused:
+                # warning_rank0_once: the dispatch is decided once per process
+                # (lru_cached probes), so the warning must fire once per
+                # process too -- not once per GDN call (observed 18480 lines
+                # in a real SFT run otherwise) and not once per rank. The
+                # shared instance is what makes the dedup stateful.
+                _dispatch_logger().warning_rank0_once(
                     "fused GDN forward usable but the fused backward is not "
                     "on this install/device; using fused forward + composed "
                     "backward.",
@@ -253,14 +260,14 @@ def ascendc_chunk_gated_delta_rule(
                 bwd_fused,
             )
             return o, final_state
-        if _warn_once("fwd_unusable"):
-            from torchturbo.logging import get_logger
-
-            get_logger(__name__).warning(
-                "fused GDN forward unusable on this install/device (probe "
-                "failed); falling back to the composed AscendC chain. "
-                "Set TORCHTURBO_GDN_USE_FUSED=0 to silence this check."
-            )
+        # warning_rank0_once: probe result is cached per process, so the
+        # warning fires once per process (not per GDN call) and only on
+        # rank 0, through the shared logger instance.
+        _dispatch_logger().warning_rank0_once(
+            "fused GDN forward unusable on this install/device (probe "
+            "failed); falling back to the composed AscendC chain. "
+            "Set TORCHTURBO_GDN_USE_FUSED=0 to silence this check."
+        )
 
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,

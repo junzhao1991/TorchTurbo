@@ -28,12 +28,12 @@ _kkt_fwd_kernel = triton.jit(
 
 
 def _kernel_params(kernel) -> frozenset:
-    """Parameter names of a (possibly re-wrapped) triton JIT kernel."""
-    fn = getattr(kernel, "fn", kernel)
-    try:
-        return frozenset(inspect.signature(fn).parameters)
-    except (TypeError, ValueError):  # pragma: no cover - defensive
-        return frozenset()
+    """Parameter names of the re-jitted triton kernel.
+
+    ``_kkt_fwd_kernel`` is a ``triton.runtime.jit.JITFunction`` whose ``.fn``
+    is the underlying plain function, so one unwrap lands on the signature.
+    """
+    return frozenset(inspect.signature(kernel.fn).parameters)
 
 
 # GQA landed in the KKT kernel as H_K/H_V constexprs (replacing the single

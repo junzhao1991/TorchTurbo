@@ -37,6 +37,7 @@ from .chunk_gated_delta_rule_function import (
     ListIndexDict,
     TensorIndexDict,
     _backward_chain,
+    _chunk_list,
     _normalize_varlen_metadata,
     _validate_forward_inputs,
 )
@@ -156,18 +157,30 @@ def _probe_pair(probe_bwd: bool) -> tuple[bool, str]:
         return False, repr(exc)
 
 
-@lru_cache(maxsize=None)
+@lru_cache(maxsize=1)
+def _probe_fused_pair() -> tuple[bool, bool, str]:
+    """One tiny fused launch pair per process: ``(fwd_usable, bwd_usable, reason)``.
+
+    Both directions share the probe: the bwd leg re-launches the fwd anyway to
+    build its inputs, so probing each direction through its own lru_cache
+    would launch the fwd twice and cache half a result each. The bwd leg is
+    only probed when the fwd passed (bwd implies fwd).
+    """
+    fwd_usable, reason = _probe_pair(probe_bwd=False)
+    bwd_usable = False
+    if fwd_usable:
+        bwd_usable, reason = _probe_pair(probe_bwd=True)
+    return fwd_usable, bwd_usable, reason
+
+
 def fused_fwd_usable() -> bool:
     """Cached forward-direction probe result (one tiny fused fwd launch)."""
-    usable, _ = _probe_pair(probe_bwd=False)
-    return usable
+    return _probe_fused_pair()[0]
 
 
-@lru_cache(maxsize=None)
 def fused_bwd_usable() -> bool:
     """Cached backward-direction probe result (tiny fused fwd+bwd launch)."""
-    usable, _ = _probe_pair(probe_bwd=True)
-    return usable
+    return _probe_fused_pair()[1]
 
 
 class ChunkGatedDeltaRuleAdaptiveFunction(torch.autograd.Function):
@@ -227,10 +240,15 @@ class ChunkGatedDeltaRuleAdaptiveFunction(torch.autograd.Function):
                 f"chunk_size=64, got K={key_dim}, V={value_dim}, "
                 f"chunk_size={chunk_size}"
             )
-        if fused_backward and not fused_bwd_usable():
-            # The wrapper normally prevents this; the guard keeps an explicit
-            # override (see TORCHTURBO_GDN_USE_FUSED) from failing mid-train.
-            fused_backward = False
+        # The wrapper is the single decision point: it passes
+        # fused_backward=True only when the probe passed. There is no way to
+        # reach a fused backward with an unusable kernel, so a mismatch here
+        # is a programming error, not a runtime condition to paper over.
+        if fused_backward:
+            assert fused_bwd_usable(), (
+                "fused_backward=True requires a usable fused backward kernel; "
+                "the wrapper must not pass the flag otherwise"
+            )
         (
             cu_seqlens,
             cu_seqlens_list,
@@ -250,6 +268,16 @@ class ChunkGatedDeltaRuleAdaptiveFunction(torch.autograd.Function):
         # additionally needs the device tensor for its reverse cumsum.
         ctx.cu_seqlens = cu_seqlens
 
+        expected_states = (
+            len(cu_seqlens_list) - 1
+            if cu_seqlens_list is not None
+            else batch
+        )
+        if initial_state is not None and initial_state.shape[0] != expected_states:
+            raise ValueError(
+                "initial_state sequence dimension does not match the input, "
+                f"expected={expected_states}, got={initial_state.shape[0]}"
+            )
         if initial_state is not None and ctx.needs_input_grad[6]:
             raise NotImplementedError(
                 "initial_state.requires_grad=True is unsupported by this "
@@ -271,11 +299,7 @@ class ChunkGatedDeltaRuleAdaptiveFunction(torch.autograd.Function):
             q_rstd = None
             k_rstd = None
 
-        chunk_list = (
-            chunk_indices_list.get(str(chunk_size))
-            if chunk_indices_list is not None
-            else None
-        )
+        chunk_list = _chunk_list(chunk_indices_list, chunk_size)
         fused_ops = _load_fused_ops()
         if fused_ops is None:
             raise RuntimeError(
@@ -323,7 +347,6 @@ class ChunkGatedDeltaRuleAdaptiveFunction(torch.autograd.Function):
         ctx.has_l2norm = use_qk_l2norm_in_kernel
         ctx.scale = float(scale)
         ctx.chunk_size = chunk_size
-        ctx.cu_seqlens = cu_seqlens
         ctx.cu_seqlens_list = cu_seqlens_list
         ctx.chunk_list = chunk_list
         ctx.chunk_indices = chunk_indices
