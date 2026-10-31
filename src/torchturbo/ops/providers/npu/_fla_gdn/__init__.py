@@ -33,6 +33,7 @@ verified reference and satisfies the alignment constraint.
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import torch
@@ -40,15 +41,42 @@ import torch
 from torchturbo.ops.packed_params import PackedParams
 
 from .ascendc_causal_conv1d_function import AscendCCausalConv1dFunction
-from .chunk_gated_delta_rule_function import ChunkGatedDeltaRuleFunction
+from .chunk_gated_delta_rule_function import (
+    ChunkGatedDeltaRuleFusedFunction,
+    ChunkGatedDeltaRuleFunction,
+    fused_envelope_supported,
+    fused_gdn_usable,
+)
 
 __all__ = [
     "AscendCCausalConv1dFunction",
+    "ChunkGatedDeltaRuleFusedFunction",
     "ChunkGatedDeltaRuleFunction",
     "PackedParams",
     "ascendc_causal_conv1d",
     "ascendc_chunk_gated_delta_rule",
 ]
+
+# Escape hatch for the large-fusion path: set to 0 to always use the composed
+# six-operator chain even inside the fused envelope (K=V=128, chunk=64).
+_USE_FUSED_GDN = bool(int(os.environ.get("TORCHTURBO_GDN_USE_FUSED", "1")))
+
+# One TurboLogger instance for this module, created lazily on the first
+# dispatch decision. ``get_logger`` returns a fresh TurboLogger each call and
+# the ``*_rank0_once`` dedup set lives on the instance, so calling it at warn
+# time (as earlier revisions did) re-deduplicated from scratch every GDN call
+# -- an SFT run printed the path warning once per step. Holding the instance
+# here restores once-per-process with the rank-0 filter intact.
+_logger: Optional["TurboLogger"] = None
+
+
+def _dispatch_logger():
+    global _logger
+    if _logger is None:
+        from torchturbo.logging import get_logger
+
+        _logger = get_logger(__name__)
+    return _logger
 
 
 # Preferred depthwise-conv head dimension. Equals the model's
@@ -189,6 +217,46 @@ def ascendc_chunk_gated_delta_rule(
             cu_seqlens_list = [
                 int(item) for item in cu_seqlens.detach().cpu().tolist()
             ]
+
+    if _USE_FUSED_GDN and fused_envelope_supported(
+        k.shape[-1], v.shape[-1], chunk_size
+    ):
+        # Fused-pair dispatch: only when forward AND backward can both run
+        # on the fused kernels (enabled probe + K=V=128/chunk=64 envelope).
+        # No mixed granularity -- the fused backward consumes the
+        # g_cumsum/A exports only the fused forward produces, so a fused
+        # forward with a composed backward is not a supported combination.
+        # Any miss (probe failed, outside the envelope, escape hatch off)
+        # runs the composed chain for both directions instead.
+        if fused_gdn_usable():
+            o, final_state = ChunkGatedDeltaRuleFusedFunction.apply(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                scale,
+                initial_state,
+                output_final_state,
+                cu_seqlens,
+                cu_seqlens_list,
+                chunk_indices,
+                chunk_indices_list,
+                use_qk_l2norm_in_kernel,
+                chunk_size,
+            )
+            return o, final_state
+        # warning_rank0_once: the probe is decided once per process
+        # (lru_cached), so the warning must fire once per process too --
+        # not once per GDN call (observed 18480 lines in a real SFT run
+        # otherwise) and not once per rank. The shared instance is what
+        # makes the dedup stateful.
+        _dispatch_logger().warning_rank0_once(
+            "fused GDN fwd+bwd pair unusable on this install/device (probe "
+            "failed); falling back to the composed AscendC chain for both "
+            "directions. Set TORCHTURBO_GDN_USE_FUSED=0 to silence this "
+            "check."
+        )
 
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
         q,

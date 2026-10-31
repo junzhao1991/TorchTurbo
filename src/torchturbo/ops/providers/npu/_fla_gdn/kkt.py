@@ -2,7 +2,7 @@
 
 import torch
 import triton
-from fla.ops.triton.triton_core.chunk_scaled_dot_kkt import (
+from fla_npu.ops.triton.triton_core.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd_kernel as _upstream_kernel,
 )
 from fla_npu.ops.triton import chunk_scaled_dot_kkt_fwd as _upstream_fwd
@@ -43,6 +43,8 @@ def chunk_scaled_dot_kkt_fwd(
     output = torch.empty(
         batch, tokens, heads, chunk_size, device=k.device, dtype=output_dtype
     )
+    # k is already expanded to value_heads (see _expand_k_for_kkt), so
+    # H_K == H_V == heads and HV_PER_HK == 1 in the kernel's GQA constexprs.
     _kkt_fwd_kernel[(24,)](
         k=k,
         g=g,
@@ -51,7 +53,8 @@ def chunk_scaled_dot_kkt_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=tokens,
-        H=heads,
+        H_K=heads,
+        H_V=heads,
         K=dim,
         BT=chunk_size,
         BK=128,

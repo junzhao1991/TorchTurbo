@@ -1,34 +1,32 @@
-"""Complete autograd adapter for the AscendC chunk gated-delta-rule chain.
+"""Autograd adapters for the AscendC chunk gated-delta-rule kernels.
 
-The public entry is ``ChunkGatedDeltaRuleFunction.apply`` with this signature::
+Two ``apply`` entry points share this module; both take head-first
+``q/k [B,Hk,T,K]``, ``v [B,Hv,T,V]``, BSN ``g/beta [B,T,Hv]`` and return
+sequence-major ``o [B,T,Hv,V]``:
 
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
-        q,
-        k,
-        v,
-        g,
-        beta,
-        float(scale),
-        initial_state,
-        output_final_state,
-        cu_seqlens,
-        cu_seqlens_list,
-        chunk_indices,
-        chunk_indices_list,
-        use_qk_l2norm_in_kernel,
-        chunk_size,
-        save_backward_intermediates,
-    )
+* :class:`ChunkGatedDeltaRuleFunction` -- the composed AscendC operator
+  chain. Its signature ends with ``save_backward_intermediates``. It
+  implements the full forward and backward chains, including GVA head
+  reduction, and supports ``initial_state`` as a constant forward input.
+* :class:`ChunkGatedDeltaRuleFusedFunction` -- the fused
+  ``npu_chunk_gated_delta_rule_fwd``/``bwd`` pair, used when both directions
+  run on the fused kernels. The q/k l2norm stays outside the fused pair (the
+  in-kernel export is an A5-only path), so gradient post-processing matches
+  the composed adapter.
 
-The adapter implements the full forward and backward chains, including GVA
-head reduction. It supports ``initial_state`` as a constant forward input,
-but does not implement initial-state or final-state gradients. Unsupported
-combinations are rejected before the first compute kernel is launched.
+Mixed granularity (fused forward with composed backward, or vice versa) is
+not supported: the fused backward consumes the ``g_cumsum``/``A`` exports
+only the fused forward produces, so the wrapper in ``__init__`` picks the
+fused pair only when the fused fwd+bwd probe passed and the envelope
+(K=V=128, chunk_size=64) holds; everything else runs the composed chain.
+Unsupported combinations are rejected before the first compute kernel is
+launched. Neither adapter implements initial-state or final-state gradients.
 """
 
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from typing import Dict, Optional
 
 import torch
@@ -967,4 +965,394 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         )
 
 
-__all__ = ["ChunkGatedDeltaRuleFunction"]
+__all__ = [
+    "ChunkGatedDeltaRuleFusedFunction",
+    "ChunkGatedDeltaRuleFunction",
+    "fused_envelope_supported",
+    "fused_gdn_usable",
+]
+
+
+# ---------------------------------------------------------------------------
+# Large-fusion path (fwd+bwd both on the fused AscendC kernels)
+# ---------------------------------------------------------------------------
+#
+# The fused kernels are strictly narrower than the composed chain: the
+# envelope is K=V=128 with chunk_size=64, and both directions must come from
+# the same fused pair -- the fused backward consumes the ``g_cumsum``/``A``
+# only the fused forward exports, so a fused forward with a composed backward
+# is not a supported combination. The wrapper dispatches here only when the
+# single fused-pair probe passed (fwd and bwd together); everything else,
+# including an unusable probe, stays on the composed chain.
+
+_FUSED_KEY_DIM = 128
+_FUSED_VALUE_DIM = 128
+_FUSED_CHUNK_SIZE = 64
+
+# The fused pair is imported lazily and cached so this module stays
+# importable on installs whose wheel carries the composed-chain ops only
+# (the same rule the dispatch probe follows for optional dependencies).
+_FUSED_OPS_CACHE: Optional[tuple] = None
+
+
+def _load_fused_ops() -> Optional[tuple]:
+    """Import the fused fwd/bwd pair once, or None when unavailable."""
+    global _FUSED_OPS_CACHE
+    if _FUSED_OPS_CACHE is None:
+        try:
+            from fla_npu.ops.ascendc import (
+                npu_chunk_gated_delta_rule_bwd,
+                npu_chunk_gated_delta_rule_fwd,
+            )
+        except ImportError:
+            return None
+        _FUSED_OPS_CACHE = (
+            npu_chunk_gated_delta_rule_fwd,
+            npu_chunk_gated_delta_rule_bwd,
+        )
+    return _FUSED_OPS_CACHE
+
+
+def fused_envelope_supported(
+    key_dim: int,
+    value_dim: int,
+    chunk_size: int,
+) -> bool:
+    """Whether the fused fwd/bwd pair covers this shape configuration."""
+    return (
+        key_dim == _FUSED_KEY_DIM
+        and value_dim == _FUSED_VALUE_DIM
+        and chunk_size == _FUSED_CHUNK_SIZE
+    )
+
+
+@lru_cache(maxsize=1)
+def _probe_fused_pair() -> bool:
+    """One tiny fused fwd+bwd launch per process; True only when both work.
+
+    Importability is not enough: a wheel can expose the Python entries of
+    the fused pair while the compiled backend has no working kernel for
+    this SoC. Probing costs one small launch of each direction and lets the
+    wrapper adapt instead of crashing mid-training.
+    """
+    fused_ops = _load_fused_ops()
+    if fused_ops is None:
+        return False
+    npu_fwd, npu_bwd = fused_ops
+    try:
+        q = torch.randn(1, 1, 64, 128, device="npu", dtype=torch.bfloat16)
+        k = torch.randn(1, 1, 64, 128, device="npu", dtype=torch.bfloat16)
+    except Exception:  # noqa: BLE001 - no NPU here means never usable
+        return False
+    try:
+        v = torch.randn(1, 1, 64, 128, device="npu", dtype=torch.bfloat16)
+        g = -torch.rand(1, 64, 1, device="npu", dtype=torch.float32) * 0.1
+        beta = torch.rand(1, 64, 1, device="npu", dtype=torch.float32)
+        do = torch.randn(1, 64, 1, 128, device="npu", dtype=torch.bfloat16)
+        (
+            _o,
+            _final_state,
+            g_cumsum,
+            A,
+            _beta_eff,
+            _h,
+            _q_hat,
+            _k_hat,
+            _q_rstd,
+            _k_rstd,
+        ) = npu_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            output_final_state=False,
+            chunk_size=_FUSED_CHUNK_SIZE,
+            scale=1.0,
+            disable_recompute=True,
+        )
+        (
+            _dq,
+            _dk,
+            _dv,
+            _d_beta,
+            _d_g,
+            _dh0,
+            _d_a_log,
+            _d_dt_bias,
+        ) = npu_bwd(
+            q,
+            k,
+            v,
+            g_cumsum,
+            beta,
+            A,
+            do,
+            1.0,
+            chunk_size=_FUSED_CHUNK_SIZE,
+        )
+        torch.npu.synchronize()
+    except Exception:  # noqa: BLE001 - any launch failure means unusable
+        return False
+    return True
+
+
+def fused_gdn_usable() -> bool:
+    """Cached fused fwd+bwd probe: both kernels launch on this install."""
+    return _probe_fused_pair()
+
+
+class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
+    """Autograd binding with the fused forward and the fused backward.
+
+    ``apply`` keeps the composed-chain adapter's signature verbatim minus the
+    trailing ``save_backward_intermediates`` flag (the fused backward needs no
+    saved recomputables). The wrapper is the single decision point: it only
+    dispatches here when the envelope holds and the fused-pair probe passed.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        scale: float,
+        initial_state: Optional[torch.Tensor],
+        output_final_state: bool,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        cu_seqlens_list: Optional[list[int]] = None,
+        chunk_indices: Optional[TensorIndexDict | torch.Tensor] = None,
+        chunk_indices_list: Optional[
+            ListIndexDict | list[int] | tuple[int, ...] | torch.Tensor
+        ] = None,
+        use_qk_l2norm_in_kernel: bool = False,
+        chunk_size: int = _FUSED_CHUNK_SIZE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        (
+            batch,
+            _key_heads,
+            _value_heads,
+            tokens,
+            key_dim,
+            value_dim,
+        ) = _validate_forward_inputs(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            use_qk_l2norm_in_kernel,
+            chunk_size,
+        )
+        if not fused_envelope_supported(key_dim, value_dim, chunk_size):
+            raise ValueError(
+                "the fused AscendC GDR pair requires K=V=128 and "
+                f"chunk_size=64, got K={key_dim}, V={value_dim}, "
+                f"chunk_size={chunk_size}"
+            )
+
+        (
+            cu_seqlens,
+            cu_seqlens_list,
+            chunk_indices,
+            chunk_indices_list,
+        ) = _normalize_varlen_metadata(
+            g=g,
+            total_tokens=tokens,
+            batch=batch,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_list=cu_seqlens_list,
+            chunk_indices=chunk_indices,
+            chunk_indices_list=chunk_indices_list,
+        )
+        expected_states = (
+            len(cu_seqlens_list) - 1
+            if cu_seqlens_list is not None
+            else batch
+        )
+        if initial_state is not None and initial_state.shape[0] != expected_states:
+            raise ValueError(
+                "initial_state sequence dimension does not match the input, "
+                f"expected={expected_states}, got={initial_state.shape[0]}"
+            )
+        if initial_state is not None and ctx.needs_input_grad[6]:
+            raise NotImplementedError(
+                "initial_state.requires_grad=True is unsupported by this "
+                "adapter. Pass a detached initial_state."
+            )
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        g = g.contiguous()
+        beta = beta.contiguous()
+        main_dtype = q.dtype
+        if initial_state is not None:
+            initial_state = initial_state.contiguous()
+        if use_qk_l2norm_in_kernel:
+            q, q_rstd = l2norm_fwd(q)
+            k, k_rstd = l2norm_fwd(k)
+        else:
+            q_rstd = None
+            k_rstd = None
+
+        chunk_list = _chunk_list(chunk_indices_list, chunk_size)
+        fused_ops = _load_fused_ops()
+        if fused_ops is None:
+            raise RuntimeError(
+                "the installed fla_npu does not provide the large-fusion "
+                "npu_chunk_gated_delta_rule_fwd/bwd pair; the wrapper "
+                "should have dispatched to the composed chain"
+            )
+        npu_fwd = fused_ops[0]
+        (
+            o,
+            final_state,
+            g_cumsum,
+            A,
+            _beta_eff,
+            _h,
+            _q_hat,
+            _k_hat,
+            _q_rstd,
+            _k_rstd,
+        ) = npu_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens_list,
+            chunk_indices=chunk_list,
+            scale=float(scale),
+            disable_recompute=True,
+            return_intermediate_states=False,
+            state_v_first=False,
+        )
+        # With use_qk_l2norm_in_kernel=False the kernel treats the (already
+        # externally normalized) q/k as raw inputs and aliases q_hat/k_hat to
+        # them; the fused backward therefore needs no rstd.
+
+        # Saved in the exact spelling the fused backward consumes: q/k
+        # normalized, g exported as g_cumsum (still [B,T,Hv] BSN).
+        ctx.save_for_backward(
+            q, k, v, g_cumsum, beta, A, initial_state, q_rstd, k_rstd
+        )
+        ctx.has_l2norm = use_qk_l2norm_in_kernel
+        ctx.scale = float(scale)
+        ctx.chunk_size = chunk_size
+        ctx.cu_seqlens = cu_seqlens
+        ctx.cu_seqlens_list = cu_seqlens_list
+        ctx.chunk_list = chunk_list
+        ctx.set_materialize_grads(False)
+
+        # o comes out sequence-major [B, T, Hv, V]; the wrapper transposes.
+        if not output_final_state:
+            final_state = None
+        return o.to(main_dtype), final_state
+
+    @staticmethod
+    def backward(
+        ctx,
+        do: Optional[torch.Tensor],
+        dht: Optional[torch.Tensor],
+    ):
+        # Guard: the fused backward has no path through final_state. The
+        # engine hands back a zero gradient for the discarded output; a real
+        # one means the caller's loss depends on final_state and cannot be
+        # served here.
+        if dht is not None and bool(dht.any()):
+            raise RuntimeError(
+                "ascendc_chunk_gated_delta_rule: got a non-zero gradient "
+                "for final_state; the fused backward does not support "
+                "gradients w.r.t. it."
+            )
+        if do is None:
+            # Nothing differentiates through o; no input gradient is owed.
+            return (None,) * 14
+
+        (
+            q,
+            k,
+            v,
+            g_cumsum,
+            beta,
+            A,
+            initial_state,
+            q_rstd,
+            k_rstd,
+        ) = ctx.saved_tensors
+        # do matches o's [B, T, Hv, V] sequence-major layout, which the
+        # fused backward expects.
+        do = do.contiguous()
+
+        fused_ops = _load_fused_ops()
+        if fused_ops is None:
+            raise RuntimeError(
+                "the installed fla_npu lost the large-fusion backward"
+            )
+        npu_bwd = fused_ops[1]
+        (
+            dq,
+            dk,
+            dv,
+            d_beta,
+            d_g,
+            _dh0,
+            _d_a_log,
+            _d_dt_bias,
+        ) = npu_bwd(
+            q,
+            k,
+            v,
+            g_cumsum,
+            beta,
+            A,
+            do,
+            ctx.scale,
+            chunk_size=ctx.chunk_size,
+            cu_seqlens=ctx.cu_seqlens_list,
+            chunk_indices=ctx.chunk_list,
+            initial_state=initial_state,
+            dht=None,
+            use_qk_l2norm_in_kernel=False,
+            use_exp2=False,
+        )
+        # d_g is already the raw-gate gradient (the composite backward
+        # applies the reverse chunk-local cumsum and the GVA head reduction
+        # internally); dq/dk are w.r.t. the normalized q/k.
+        del _dh0, _d_a_log, _d_dt_bias
+        if ctx.has_l2norm:
+            assert q_rstd is not None and k_rstd is not None
+            dq = l2norm_bwd(q, q_rstd, dq)
+            dk = l2norm_bwd(k, k_rstd, dk)
+        # The order must match all 14 forward inputs exactly:
+        # q, k, v, g, beta, scale, initial_state, output_final_state,
+        # cu_seqlens, cu_seqlens_list, chunk_indices, chunk_indices_list,
+        # use_qk_l2norm_in_kernel, chunk_size.
+        return (
+            dq.to(q.dtype),
+            dk.to(k.dtype),
+            dv.to(v.dtype),
+            d_g.to(g_cumsum.dtype),
+            d_beta.to(beta.dtype),
+            None,  # scale
+            None,  # initial_state gradient (rejected in forward)
+            None,  # output_final_state
+            None,
+            None,
+            None,
+            None,
+            None,  # use_qk_l2norm_in_kernel
+            None,  # chunk_size
+        )
