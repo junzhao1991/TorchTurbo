@@ -1,23 +1,10 @@
 """Reuse the FLA KKT kernel across packed chunk-count alignment classes."""
 
-import inspect
-
 import torch
 import triton
-
-# The KKT kernel lives in different places across fla_npu generations:
-# 26.9.1+ wheels vendor it at fla_npu.ops.triton.triton_core (built from the
-# repo's fla/ overlay, see fla_npu setup.py), while 26.6.0-era wheels merely
-# re-export it from the fork-fla package overlay. Prefer the self-contained
-# path (works with a stock fla) and fall back to the fork overlay.
-try:
-    from fla_npu.ops.triton.triton_core.chunk_scaled_dot_kkt import (
-        chunk_scaled_dot_kkt_fwd_kernel as _upstream_kernel,
-    )
-except ImportError:
-    from fla.ops.triton.triton_core.chunk_scaled_dot_kkt import (
-        chunk_scaled_dot_kkt_fwd_kernel as _upstream_kernel,
-    )
+from fla_npu.ops.triton.triton_core.chunk_scaled_dot_kkt import (
+    chunk_scaled_dot_kkt_fwd_kernel as _upstream_kernel,
+)
 from fla_npu.ops.triton import chunk_scaled_dot_kkt_fwd as _upstream_fwd
 
 # Keep the upstream computation while excluding packed work counts from the
@@ -25,22 +12,6 @@ from fla_npu.ops.triton import chunk_scaled_dot_kkt_fwd as _upstream_fwd
 _kkt_fwd_kernel = triton.jit(
     _upstream_kernel.fn.fn, do_not_specialize=["T", "NT", "TOTAL_TASKS"]
 )
-
-
-def _kernel_params(kernel) -> frozenset:
-    """Parameter names of the re-jitted triton kernel.
-
-    ``_kkt_fwd_kernel`` is a ``triton.runtime.jit.JITFunction`` whose ``.fn``
-    is the underlying plain function, so one unwrap lands on the signature.
-    """
-    return frozenset(inspect.signature(kernel.fn).parameters)
-
-
-# GQA landed in the KKT kernel as H_K/H_V constexprs (replacing the single
-# H): newer releases require both, older ones reject them. Probe once which
-# generation the installed fla ships so the raw launch below works on either.
-_KKT_PARAMS = _kernel_params(_kkt_fwd_kernel)
-_KKT_HAS_GQA_PARAMS = "H_K" in _KKT_PARAMS
 
 
 def chunk_scaled_dot_kkt_fwd(
@@ -72,12 +43,8 @@ def chunk_scaled_dot_kkt_fwd(
     output = torch.empty(
         batch, tokens, heads, chunk_size, device=k.device, dtype=output_dtype
     )
-    if _KKT_HAS_GQA_PARAMS:
-        # k is already expanded to value_heads (see _expand_k_for_kkt), so
-        # H_K == H_V == heads and HV_PER_HK == 1, matching the old H spelling.
-        head_args = {"H_K": heads, "H_V": heads}
-    else:
-        head_args = {"H": heads}
+    # k is already expanded to value_heads (see _expand_k_for_kkt), so
+    # H_K == H_V == heads and HV_PER_HK == 1 in the kernel's GQA constexprs.
     _kkt_fwd_kernel[(24,)](
         k=k,
         g=g,
@@ -86,7 +53,8 @@ def chunk_scaled_dot_kkt_fwd(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
         T=tokens,
-        **head_args,
+        H_K=heads,
+        H_V=heads,
         K=dim,
         BT=chunk_size,
         BK=128,

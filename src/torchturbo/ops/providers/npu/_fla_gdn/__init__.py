@@ -41,17 +41,16 @@ import torch
 from torchturbo.ops.packed_params import PackedParams
 
 from .ascendc_causal_conv1d_function import AscendCCausalConv1dFunction
-from .chunk_gated_delta_rule_function import ChunkGatedDeltaRuleFunction
-from .chunk_gated_delta_rule_fused_function import (
-    ChunkGatedDeltaRuleAdaptiveFunction,
-    fused_bwd_usable,
+from .chunk_gated_delta_rule_function import (
+    ChunkGatedDeltaRuleFusedFunction,
+    ChunkGatedDeltaRuleFunction,
     fused_envelope_supported,
-    fused_fwd_usable,
+    fused_gdn_usable,
 )
 
 __all__ = [
     "AscendCCausalConv1dFunction",
-    "ChunkGatedDeltaRuleAdaptiveFunction",
+    "ChunkGatedDeltaRuleFusedFunction",
     "ChunkGatedDeltaRuleFunction",
     "PackedParams",
     "ascendc_causal_conv1d",
@@ -222,27 +221,15 @@ def ascendc_chunk_gated_delta_rule(
     if _USE_FUSED_GDN and fused_envelope_supported(
         k.shape[-1], v.shape[-1], chunk_size
     ):
-        fwd_fused = fused_fwd_usable()
-        bwd_fused = fwd_fused and fused_bwd_usable()
-        if fwd_fused:
-            # Adaptive large-fusion dispatch: the forward is one fused aclnn
-            # call (exports the g_cumsum/A the backward consumes); the
-            # backward is fused too when its kernel is usable, otherwise the
-            # composed four-operator chain runs over the fused forward's
-            # exports (it recomputes w/u/h/v_new itself). Falls through to
-            # the composed chain entirely when the fused forward is missing.
-            if not bwd_fused:
-                # warning_rank0_once: the dispatch is decided once per process
-                # (lru_cached probes), so the warning must fire once per
-                # process too -- not once per GDN call (observed 18480 lines
-                # in a real SFT run otherwise) and not once per rank. The
-                # shared instance is what makes the dedup stateful.
-                _dispatch_logger().warning_rank0_once(
-                    "fused GDN forward usable but the fused backward is not "
-                    "on this install/device; using fused forward + composed "
-                    "backward.",
-                )
-            o, final_state = ChunkGatedDeltaRuleAdaptiveFunction.apply(
+        # Fused-pair dispatch: only when forward AND backward can both run
+        # on the fused kernels (enabled probe + K=V=128/chunk=64 envelope).
+        # No mixed granularity -- the fused backward consumes the
+        # g_cumsum/A exports only the fused forward produces, so a fused
+        # forward with a composed backward is not a supported combination.
+        # Any miss (probe failed, outside the envelope, escape hatch off)
+        # runs the composed chain for both directions instead.
+        if fused_gdn_usable():
+            o, final_state = ChunkGatedDeltaRuleFusedFunction.apply(
                 q,
                 k,
                 v,
@@ -257,16 +244,18 @@ def ascendc_chunk_gated_delta_rule(
                 chunk_indices_list,
                 use_qk_l2norm_in_kernel,
                 chunk_size,
-                bwd_fused,
             )
             return o, final_state
-        # warning_rank0_once: probe result is cached per process, so the
-        # warning fires once per process (not per GDN call) and only on
-        # rank 0, through the shared logger instance.
+        # warning_rank0_once: the probe is decided once per process
+        # (lru_cached), so the warning must fire once per process too --
+        # not once per GDN call (observed 18480 lines in a real SFT run
+        # otherwise) and not once per rank. The shared instance is what
+        # makes the dedup stateful.
         _dispatch_logger().warning_rank0_once(
-            "fused GDN forward unusable on this install/device (probe "
-            "failed); falling back to the composed AscendC chain. "
-            "Set TORCHTURBO_GDN_USE_FUSED=0 to silence this check."
+            "fused GDN fwd+bwd pair unusable on this install/device (probe "
+            "failed); falling back to the composed AscendC chain for both "
+            "directions. Set TORCHTURBO_GDN_USE_FUSED=0 to silence this "
+            "check."
         )
 
     o, final_state = ChunkGatedDeltaRuleFunction.apply(
