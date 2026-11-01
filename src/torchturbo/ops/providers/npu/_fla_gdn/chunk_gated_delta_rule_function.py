@@ -16,17 +16,16 @@ sequence-major ``o [B,T,Hv,V]``:
 
 Mixed granularity (fused forward with composed backward, or vice versa) is
 not supported: the fused backward consumes the ``g_cumsum``/``A`` exports
-only the fused forward produces, so the wrapper in ``__init__`` picks the
-fused pair only when the fused fwd+bwd probe passed and the envelope
-(K=V=128, chunk_size=64) holds; everything else runs the composed chain.
-Unsupported combinations are rejected before the first compute kernel is
-launched. Neither adapter implements initial-state or final-state gradients.
+only the fused forward produces. The GDN path targets the fused pair
+exclusively (fla-npu >= 26.10.0); shapes outside its K=V=128 /
+chunk_size=64 envelope, or an install without the pair, raise instead of
+falling back to the composed chain. Neither adapter implements
+initial-state or final-state gradients.
 """
 
 from __future__ import annotations
 
 import math
-from functools import lru_cache
 from typing import Dict, Optional
 
 import torch
@@ -968,8 +967,6 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 __all__ = [
     "ChunkGatedDeltaRuleFusedFunction",
     "ChunkGatedDeltaRuleFunction",
-    "fused_envelope_supported",
-    "fused_gdn_usable",
 ]
 
 
@@ -981,125 +978,39 @@ __all__ = [
 # envelope is K=V=128 with chunk_size=64, and both directions must come from
 # the same fused pair -- the fused backward consumes the ``g_cumsum``/``A``
 # only the fused forward exports, so a fused forward with a composed backward
-# is not a supported combination. The wrapper dispatches here only when the
-# single fused-pair probe passed (fwd and bwd together); everything else,
-# including an unusable probe, stays on the composed chain.
+# is not a supported combination. The GDN wrapper targets the fused pair
+# exclusively (fla-npu >= 26.10.0): any shape or install outside that
+# envelope is rejected with an error rather than falling back to the
+# composed chain.
 
 _FUSED_KEY_DIM = 128
 _FUSED_VALUE_DIM = 128
 _FUSED_CHUNK_SIZE = 64
 
-# The fused pair is imported lazily and cached so this module stays
-# importable on installs whose wheel carries the composed-chain ops only
-# (the same rule the dispatch probe follows for optional dependencies).
-_FUSED_OPS_CACHE: Optional[tuple] = None
+# The fused pair is a hard dependency of this path: it ships in the
+# fla-npu 26.10.0 wheel, so it is imported directly like the composed-chain
+# ops. A missing pair surfaces as an ImportError at module import time.
+from fla_npu.ops.ascendc import (  # noqa: E402
+    npu_chunk_gated_delta_rule_bwd as _fused_bwd,
+    npu_chunk_gated_delta_rule_fwd as _fused_fwd,
+)
 
 
-def _load_fused_ops() -> Optional[tuple]:
-    """Import the fused fwd/bwd pair once, or None when unavailable."""
-    global _FUSED_OPS_CACHE
-    if _FUSED_OPS_CACHE is None:
-        try:
-            from fla_npu.ops.ascendc import (
-                npu_chunk_gated_delta_rule_bwd,
-                npu_chunk_gated_delta_rule_fwd,
-            )
-        except ImportError:
-            return None
-        _FUSED_OPS_CACHE = (
-            npu_chunk_gated_delta_rule_fwd,
-            npu_chunk_gated_delta_rule_bwd,
-        )
-    return _FUSED_OPS_CACHE
-
-
-def fused_envelope_supported(
+def _require_fused_envelope(
     key_dim: int,
     value_dim: int,
     chunk_size: int,
-) -> bool:
-    """Whether the fused fwd/bwd pair covers this shape configuration."""
-    return (
-        key_dim == _FUSED_KEY_DIM
-        and value_dim == _FUSED_VALUE_DIM
-        and chunk_size == _FUSED_CHUNK_SIZE
-    )
-
-
-@lru_cache(maxsize=1)
-def _probe_fused_pair() -> bool:
-    """One tiny fused fwd+bwd launch per process; True only when both work.
-
-    Importability is not enough: a wheel can expose the Python entries of
-    the fused pair while the compiled backend has no working kernel for
-    this SoC. Probing costs one small launch of each direction and lets the
-    wrapper adapt instead of crashing mid-training.
-    """
-    fused_ops = _load_fused_ops()
-    if fused_ops is None:
-        return False
-    npu_fwd, npu_bwd = fused_ops
-    try:
-        q = torch.randn(1, 1, 64, 128, device="npu", dtype=torch.bfloat16)
-        k = torch.randn(1, 1, 64, 128, device="npu", dtype=torch.bfloat16)
-    except Exception:  # noqa: BLE001 - no NPU here means never usable
-        return False
-    try:
-        v = torch.randn(1, 1, 64, 128, device="npu", dtype=torch.bfloat16)
-        g = -torch.rand(1, 64, 1, device="npu", dtype=torch.float32) * 0.1
-        beta = torch.rand(1, 64, 1, device="npu", dtype=torch.float32)
-        do = torch.randn(1, 64, 1, 128, device="npu", dtype=torch.bfloat16)
-        (
-            _o,
-            _final_state,
-            g_cumsum,
-            A,
-            _beta_eff,
-            _h,
-            _q_hat,
-            _k_hat,
-            _q_rstd,
-            _k_rstd,
-        ) = npu_fwd(
-            q,
-            k,
-            v,
-            g,
-            beta,
-            output_final_state=False,
-            chunk_size=_FUSED_CHUNK_SIZE,
-            scale=1.0,
-            disable_recompute=True,
+) -> None:
+    """Raise unless the configuration is inside the fused pair's envelope."""
+    if (
+        key_dim != _FUSED_KEY_DIM
+        or value_dim != _FUSED_VALUE_DIM
+        or chunk_size != _FUSED_CHUNK_SIZE
+    ):
+        raise ValueError(
+            "the fused AscendC GDR pair requires K=V=128 and chunk_size=64, "
+            f"got K={key_dim}, V={value_dim}, chunk_size={chunk_size}"
         )
-        (
-            _dq,
-            _dk,
-            _dv,
-            _d_beta,
-            _d_g,
-            _dh0,
-            _d_a_log,
-            _d_dt_bias,
-        ) = npu_bwd(
-            q,
-            k,
-            v,
-            g_cumsum,
-            beta,
-            A,
-            do,
-            1.0,
-            chunk_size=_FUSED_CHUNK_SIZE,
-        )
-        torch.npu.synchronize()
-    except Exception:  # noqa: BLE001 - any launch failure means unusable
-        return False
-    return True
-
-
-def fused_gdn_usable() -> bool:
-    """Cached fused fwd+bwd probe: both kernels launch on this install."""
-    return _probe_fused_pair()
 
 
 class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
@@ -1107,8 +1018,8 @@ class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
 
     ``apply`` keeps the composed-chain adapter's signature verbatim minus the
     trailing ``save_backward_intermediates`` flag (the fused backward needs no
-    saved recomputables). The wrapper is the single decision point: it only
-    dispatches here when the envelope holds and the fused-pair probe passed.
+    saved recomputables). The fused pair is the only GDN dispatch target --
+    the wrapper never falls back to the composed chain.
     """
 
     @staticmethod
@@ -1150,12 +1061,7 @@ class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
             use_qk_l2norm_in_kernel,
             chunk_size,
         )
-        if not fused_envelope_supported(key_dim, value_dim, chunk_size):
-            raise ValueError(
-                "the fused AscendC GDR pair requires K=V=128 and "
-                f"chunk_size=64, got K={key_dim}, V={value_dim}, "
-                f"chunk_size={chunk_size}"
-            )
+        _require_fused_envelope(key_dim, value_dim, chunk_size)
 
         (
             cu_seqlens,
@@ -1204,14 +1110,6 @@ class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
             k_rstd = None
 
         chunk_list = _chunk_list(chunk_indices_list, chunk_size)
-        fused_ops = _load_fused_ops()
-        if fused_ops is None:
-            raise RuntimeError(
-                "the installed fla_npu does not provide the large-fusion "
-                "npu_chunk_gated_delta_rule_fwd/bwd pair; the wrapper "
-                "should have dispatched to the composed chain"
-            )
-        npu_fwd = fused_ops[0]
         (
             o,
             final_state,
@@ -1223,7 +1121,7 @@ class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
             _k_hat,
             _q_rstd,
             _k_rstd,
-        ) = npu_fwd(
+        ) = _fused_fwd(
             q,
             k,
             v,
@@ -1296,12 +1194,6 @@ class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
         # fused backward expects.
         do = do.contiguous()
 
-        fused_ops = _load_fused_ops()
-        if fused_ops is None:
-            raise RuntimeError(
-                "the installed fla_npu lost the large-fusion backward"
-            )
-        npu_bwd = fused_ops[1]
         (
             dq,
             dk,
@@ -1311,7 +1203,7 @@ class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
             _dh0,
             _d_a_log,
             _d_dt_bias,
-        ) = npu_bwd(
+        ) = _fused_bwd(
             q,
             k,
             v,

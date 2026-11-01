@@ -1,28 +1,25 @@
-"""Fused GDN dispatch tests: the probe drives the wrapper decision.
+"""Fused-only GDN dispatch tests: the wrapper never falls back.
 
-These tests mock the ``fused_gdn_usable`` probe (a thin reader of one
-lru_cached `_probe_fused_pair` result) to cover the dispatch cases without
-running any real fused kernel:
+``ascendc_chunk_gated_delta_rule`` targets the 26.10.0 fused
+``npu_chunk_gated_delta_rule_fwd/bwd`` pair exclusively. These tests
+replace both autograd Functions with recorders (nothing launches on
+device) and lock down the wrapper's contract:
 
-* probe true                -> FusedFunction (fwd+bwd both fused)
-* probe false               -> composed ChunkGatedDeltaRuleFunction, both
-                              directions (no mixed granularity; the fused
-                              backward needs the fused forward's exports)
-* probe true but outside the fused envelope (V=256) -> composed chain
-* ``_USE_FUSED_GDN`` escape hatch off -> composed chain
-
-The Function classes themselves are replaced by recorders, so nothing
-launches on device; only the wrapper's dispatch logic (argument passing)
-is under test. A separate test locks the probe's once-per-process caching
-semantics against ``_probe_pair``-style failures.
+* the happy path makes exactly one ``ChunkGatedDeltaRuleFusedFunction``
+  call with the 14-arg fusion signature and never touches the composed
+  ``ChunkGatedDeltaRuleFunction``;
+* there is no escape hatch and no probe: no dispatch branch exists to
+  exercise;
+* shapes outside the fused envelope (V=256, chunk_size=128) and
+  ``save_backward_intermediates`` (a composed-chain-only option) fail
+  loudly inside the fused adapter's own validation -- no fallback.
 
 These tests import the vendored adapter (which needs ``fla_npu`` /
-``torch_npu``), so they run on an NPU install; the importorskip guards make
-them a no-op elsewhere.
+``torch_npu``), so they run on an NPU install; the importorskip guards
+make them a no-op elsewhere.
 """
 
 import pytest
-from functools import lru_cache
 
 pytest.importorskip("torch_npu")
 pytest.importorskip("fla_npu")
@@ -30,7 +27,6 @@ pytest.importorskip("fla_npu")
 import torch  # noqa: E402
 
 import torchturbo.ops.providers.npu._fla_gdn as gdn_pkg  # noqa: E402
-import torchturbo.ops.providers.npu._fla_gdn.chunk_gated_delta_rule_function as gdn_fn  # noqa: E402
 
 
 def _fake_tensors(batch=1, tokens=1057, value_dim=128):
@@ -46,43 +42,19 @@ def _fake_tensors(batch=1, tokens=1057, value_dim=128):
 class _Recorder:
     """Mimics a torch.autograd.Function: ``.apply(...)`` records the call."""
 
-    def __init__(self, result=(torch.zeros(1), None)):
-        self.result = result
+    def __init__(self):
         self.calls = []
 
     def apply(self, *args, **kwargs):  # noqa: D102 (stands in for Function)
         self.calls.append((args, kwargs))
-        return self.result
+        return torch.zeros(1), None
 
 
-@pytest.fixture
-def clean_probe_cache():
-    """Clear the probe cache around every test.
-
-    ``fused_gdn_usable`` reads one lru_cached `_probe_fused_pair` result.
-    Tests monkeypatching the probe on ``gdn_pkg`` bypass it entirely (the
-    wrapper calls the patched callable), but tests monkeypatching on
-    ``gdn_fn`` still hit the cache through the real ``fused_gdn_usable``,
-    so the reset keeps them order-independent.
-    """
-
-    def _clear():
-        cached = getattr(gdn_fn._probe_fused_pair, "cache_clear", None)
-        if cached is not None:  # monkeypatched probes have no cache
-            cached()
-
-    _clear()
-    yield
-    _clear()
-
-
-def _run_wrapper(monkeypatch, tensors, use_fused=True, **extra):
+def _run_wrapper(monkeypatch, tensors, **extra):
     fused_rec = _Recorder()
     composed_rec = _Recorder()
     monkeypatch.setattr(gdn_pkg, "ChunkGatedDeltaRuleFusedFunction", fused_rec)
     monkeypatch.setattr(gdn_pkg, "ChunkGatedDeltaRuleFunction", composed_rec)
-    if use_fused is not None:
-        monkeypatch.setattr(gdn_pkg, "_USE_FUSED_GDN", use_fused)
     q, k, v, g, beta = tensors
     o, final_state = gdn_pkg.ascendc_chunk_gated_delta_rule(
         q=q, k=k, v=v, g=g, beta=beta,
@@ -93,86 +65,84 @@ def _run_wrapper(monkeypatch, tensors, use_fused=True, **extra):
     return fused_rec, composed_rec, o, final_state
 
 
-def test_probe_true_full_fusion(monkeypatch, clean_probe_cache):
-    """Both directions fused: one FusedFunction call, no composed call."""
-    monkeypatch.setattr(gdn_pkg, "fused_gdn_usable", lambda: True)
+def test_happy_path_is_fusion_only(monkeypatch):
+    """Exactly one fused call with the 14-arg signature, no composed call."""
     fused, composed, *_ = _run_wrapper(monkeypatch, _fake_tensors())
     assert len(fused.calls) == 1
     assert len(composed.calls) == 0
     args = fused.calls[0][0]
-    assert len(args) == 14  # composed-chain 14 inputs (no save/flag extras)
+    assert len(args) == 14  # composed chain passes 15 (save_intermediates)
     # q/k/v were transposed to head-first [B,H,T,D] on the way in
     assert tuple(args[0].shape) == (1, 16, 1057, 128)
     assert tuple(args[2].shape) == (1, 32, 1057, 128)
-    assert args[5] == pytest.approx(128 ** -0.5)  # scale defaults to dk ** -0.5
+    assert args[5] == pytest.approx(128 ** -0.5)  # scale defaults to dk**-0.5
     assert args[13] == 64  # chunk_size
 
 
-def test_probe_failed_full_fallback(monkeypatch, clean_probe_cache):
-    """A failed probe falls to the composed chain for both directions --
-    no mixed granularity (fused forward with composed backward)."""
-    monkeypatch.setattr(gdn_pkg, "fused_gdn_usable", lambda: False)
-    fused, composed, *_ = _run_wrapper(monkeypatch, _fake_tensors())
-    assert len(fused.calls) == 0
-    assert len(composed.calls) == 1
-    args = composed.calls[0][0]
-    assert len(args) == 15  # original 14-input signature + save_intermediates
-    assert isinstance(args[-1], bool)  # save_backward_intermediates slot
+def test_outside_envelope_raises():
+    """V=256 is inside the fused fwd's own envelope but outside the pair's
+    (K=V=128). Nothing is patched: the real adapter's validation must
+    reject it before any kernel launch -- there is no composed-chain
+    fallback to catch it."""
+    q = torch.randn(1, 64, 2, 128, device="npu", dtype=torch.bfloat16)
+    k = torch.randn(1, 64, 2, 128, device="npu", dtype=torch.bfloat16)
+    v = torch.randn(1, 64, 2, 256, device="npu", dtype=torch.bfloat16)
+    g = -torch.rand(1, 64, 2, device="npu", dtype=torch.float32)
+    beta = torch.rand(1, 64, 2, device="npu", dtype=torch.float32)
+    with pytest.raises(ValueError, match="K=V=128"):
+        gdn_pkg.ascendc_chunk_gated_delta_rule(
+            q=q, k=k, v=v, g=g, beta=beta,
+            use_qk_l2norm_in_kernel=False,
+            chunk_size=64,
+        )
 
 
-def test_outside_envelope_ignores_probe(monkeypatch, clean_probe_cache):
-    """V=256 is in the fused fwd's own envelope but outside the fused
-    pair's (K=V=128), so the wrapper must stay composed even with the
-    probe green."""
-    monkeypatch.setattr(gdn_pkg, "fused_gdn_usable", lambda: True)
-    fused, composed, *_ = _run_wrapper(
-        monkeypatch, _fake_tensors(value_dim=256)
-    )
-    assert len(fused.calls) == 0
-    assert len(composed.calls) == 1
+def test_no_fallback_on_any_failure(monkeypatch):
+    """No probe/escape-hatch branches exist anymore, so even a fused
+    adapter that raises propagates the error; the composed chain is never
+    dispatched."""
+
+    class _Boom:
+        @staticmethod
+        def apply(*args, **kwargs):
+            raise RuntimeError("fused kernel missing on this install")
+
+    monkeypatch.setattr(gdn_pkg, "ChunkGatedDeltaRuleFusedFunction", _Boom)
+    composed_rec = _Recorder()
+    monkeypatch.setattr(gdn_pkg, "ChunkGatedDeltaRuleFunction", composed_rec)
+    with pytest.raises(RuntimeError, match="fused kernel missing"):
+        gdn_pkg.ascendc_chunk_gated_delta_rule(
+            q=torch.randn(1, 64, 2, 128),
+            k=torch.randn(1, 64, 2, 128),
+            v=torch.randn(1, 64, 2, 128),
+            g=-torch.rand(1, 64, 2),
+            beta=torch.rand(1, 64, 2),
+            use_qk_l2norm_in_kernel=False,
+            chunk_size=64,
+        )
+    assert len(composed_rec.calls) == 0
 
 
-def test_escape_hatch_disables_fusion(monkeypatch, clean_probe_cache):
-    """``_USE_FUSED_GDN`` (env TORCHTURBO_GDN_USE_FUSED=0) forced off keeps
-    the wrapper on the composed chain regardless of the probe."""
-    monkeypatch.setattr(gdn_pkg, "fused_gdn_usable", lambda: True)
-    fused, composed, *_ = _run_wrapper(
-        monkeypatch, _fake_tensors(), use_fused=False
-    )
-    assert len(fused.calls) == 0
-    assert len(composed.calls) == 1
+def test_save_backward_intermediates_is_rejected(monkeypatch):
+    """The flag only ever served the composed chain; requesting it from a
+    wrapper that never dispatches there fails fast."""
+    q = torch.randn(1, 64, 2, 128)
+    with pytest.raises(ValueError, match="save_backward_intermediates"):
+        gdn_pkg.ascendc_chunk_gated_delta_rule(
+            q=q,
+            k=torch.randn_like(q),
+            v=torch.randn_like(q),
+            g=-torch.rand(1, 64, 2),
+            beta=torch.rand(1, 64, 2),
+            use_qk_l2norm_in_kernel=False,
+            chunk_size=64,
+            save_backward_intermediates=True,
+        )
 
 
-def test_probe_cached_once_per_process(monkeypatch, clean_probe_cache):
-    """The fused-pair probe runs its tiny launch at most once, however
-    often it is asked (lru_cache around the probe)."""
-    probe_calls = []
-
-    @lru_cache(maxsize=1)
-    def fake_probe():
-        probe_calls.append(True)
-        return True
-
-    monkeypatch.setattr(gdn_fn, "_probe_fused_pair", fake_probe)
-    # fused_gdn_usable reads the module-global _probe_fused_pair at call
-    # time, so the patch above is what it executes.
-    assert gdn_fn.fused_gdn_usable() is True
-    assert gdn_fn.fused_gdn_usable() is True
-    assert gdn_fn.fused_gdn_usable() is True
-    assert probe_calls == [True]
-
-
-def test_probe_failure_caches_unusable(monkeypatch, clean_probe_cache):
-    """A launch failure inside the probe returns
-    False; the cached result must mark the pair unusable, never crash the
-    caller -- importability alone must not mark it usable."""
-    monkeypatch.setattr(gdn_fn, "_probe_fused_pair", lambda: False)
-    assert gdn_fn.fused_gdn_usable() is False
-    assert gdn_fn.fused_gdn_usable() is False
-
-
-def test_fused_envelope_supported():
-    assert gdn_fn.fused_envelope_supported(128, 128, 64) is True
-    assert gdn_fn.fused_envelope_supported(128, 256, 64) is False
-    assert gdn_fn.fused_envelope_supported(128, 128, 128) is False
-    assert gdn_fn.fused_envelope_supported(64, 128, 64) is False
+def test_dispatch_symbols_are_gone():
+    """The probe/env machinery that used to drive dispatch must stay
+    deleted: re-adding it would silently reintroduce a fallback path."""
+    assert not hasattr(gdn_pkg, "fused_gdn_usable")
+    assert not hasattr(gdn_pkg, "fused_envelope_supported")
+    assert not hasattr(gdn_pkg, "_USE_FUSED_GDN")
