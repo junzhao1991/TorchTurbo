@@ -40,10 +40,14 @@ import torch
 from torchturbo.ops.packed_params import PackedParams
 
 from .ascendc_causal_conv1d_function import AscendCCausalConv1dFunction
-from .chunk_gated_delta_rule_function import ChunkGatedDeltaRuleFunction
+from .chunk_gated_delta_rule_function import (
+    ChunkGatedDeltaRuleFusedFunction,
+    ChunkGatedDeltaRuleFunction,
+)
 
 __all__ = [
     "AscendCCausalConv1dFunction",
+    "ChunkGatedDeltaRuleFusedFunction",
     "ChunkGatedDeltaRuleFunction",
     "PackedParams",
     "ascendc_causal_conv1d",
@@ -190,7 +194,21 @@ def ascendc_chunk_gated_delta_rule(
                 int(item) for item in cu_seqlens.detach().cpu().tolist()
             ]
 
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
+    # Fused pair only -- no fallback. The fused backward consumes the
+    # g_cumsum/A exports only the fused forward produces, so any other
+    # granularity is unsupported by design. Shapes outside the K=V=128 /
+    # chunk_size=64 envelope (e.g. V=256) or an install lacking the
+    # npu_chunk_gated_delta_rule_fwd/bwd pair (fla-npu < 26.10.0 or a
+    # mis-anchored wheel) raise instead of running the composed chain.
+    # ``save_backward_intermediates`` is a composed-chain-only flag and is
+    # rejected here along with it.
+    if save_backward_intermediates:
+        raise ValueError(
+            "save_backward_intermediates is a composed-chain-only option "
+            "and the composed chain is no longer dispatched here; the "
+            "fused pair needs no saved recomputables."
+        )
+    o, final_state = ChunkGatedDeltaRuleFusedFunction.apply(
         q,
         k,
         v,
@@ -205,7 +223,6 @@ def ascendc_chunk_gated_delta_rule(
         chunk_indices_list,
         use_qk_l2norm_in_kernel,
         chunk_size,
-        save_backward_intermediates,
     )
     # o is already [B, T, H, V] (the adapter transposes back internally).
     return o, final_state

@@ -18,6 +18,10 @@ from ...registry import register_op
 
 
 # Controlled by TORCHTURBO_GDN_SAVE_BACKWARD_INTERMEDIATES (default 0).
+# NOTE: the GDN wrapper now dispatches to the fused fwd/bwd pair only; the
+# fused path rejects this flag. The env var remains a no-op-by-default dial
+# so an explicitly set value surfaces the fused path's rejection immediately
+# instead of being silently ignored.
 _SAVE_BACKWARD_INTERMEDIATES = bool(
     int(os.environ.get("TORCHTURBO_GDN_SAVE_BACKWARD_INTERMEDIATES", "0"))
 )
