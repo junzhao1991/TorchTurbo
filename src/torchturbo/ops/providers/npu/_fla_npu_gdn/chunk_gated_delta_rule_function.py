@@ -1007,6 +1007,14 @@ from fla_npu.ops.ascendc import (  # noqa: E402
 )
 
 
+# The ``info_rank0_once`` dedup set lives on the TurboLogger *instance*, and
+# ``get_logger`` builds a fresh instance per call -- so the logger (and the
+# message, which reads the wheel version once) must be cached at module
+# level or the announcement would repeat on every GDN call.
+_fused_dispatch_logger = None
+_fused_dispatch_message = None
+
+
 def _log_fused_dispatch_once() -> None:
     """Announce the fused dispatch once per rank-0 process.
 
@@ -1015,18 +1023,22 @@ def _log_fused_dispatch_once() -> None:
     without this line the only way to tell the two apart from a job log is
     indirect (absence of a fallback warning).
     """
-    try:
-        import importlib.metadata as md
+    global _fused_dispatch_logger, _fused_dispatch_message
+    if _fused_dispatch_logger is None:
+        try:
+            import importlib.metadata as md
 
-        version = md.version("flash-linear-attention-npu-a3")
-    except Exception:  # pragma: no cover - diagnostics only
-        version = "unknown"
-    from torchturbo.logging import get_logger
+            version = md.version("flash-linear-attention-npu-a3")
+        except Exception:  # pragma: no cover - diagnostics only
+            version = "unknown"
+        from torchturbo.logging import get_logger
 
-    get_logger(__name__).info_rank0_once(
-        "GDN dispatch: fused pair selected "
-        f"(npu_chunk_gated_delta_rule_fwd/bwd, fla-npu-a3 {version})"
-    )
+        _fused_dispatch_logger = get_logger(__name__)
+        _fused_dispatch_message = (
+            "GDN dispatch: fused pair selected "
+            f"(npu_chunk_gated_delta_rule_fwd/bwd, fla-npu-a3 {version})"
+        )
+    _fused_dispatch_logger.info_rank0_once(_fused_dispatch_message)
 
 
 def _require_fused_envelope(
