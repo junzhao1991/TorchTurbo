@@ -1007,6 +1007,28 @@ from fla_npu.ops.ascendc import (  # noqa: E402
 )
 
 
+def _log_fused_dispatch_once() -> None:
+    """Announce the fused dispatch once per rank-0 process.
+
+    The dispatcher table prints the provider (``ascendc_gated_delta_rule``)
+    for both the composed chain and the fused pair under the same name, so
+    without this line the only way to tell the two apart from a job log is
+    indirect (absence of a fallback warning).
+    """
+    try:
+        import importlib.metadata as md
+
+        version = md.version("flash-linear-attention-npu-a3")
+    except Exception:  # pragma: no cover - diagnostics only
+        version = "unknown"
+    from torchturbo.logging import get_logger
+
+    get_logger(__name__).info_rank0_once(
+        "GDN dispatch: fused pair selected "
+        f"(npu_chunk_gated_delta_rule_fwd/bwd, fla-npu-a3 {version})"
+    )
+
+
 def _require_fused_envelope(
     key_dim: int,
     value_dim: int,
@@ -1073,6 +1095,7 @@ class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
             chunk_size,
         )
         _require_fused_envelope(key_dim, value_dim, chunk_size)
+        _log_fused_dispatch_once()
 
         (
             cu_seqlens,
