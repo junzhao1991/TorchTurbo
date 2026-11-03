@@ -41,14 +41,14 @@ from torchturbo.ops.packed_params import PackedParams
 
 from .ascendc_causal_conv1d_function import AscendCCausalConv1dFunction
 from .chunk_gated_delta_rule_function import (
-    ChunkGatedDeltaRuleFusedFunction,
     ChunkGatedDeltaRuleFunction,
+    ChunkGatedDeltaRuleHybridFunction,
 )
 
 __all__ = [
     "AscendCCausalConv1dFunction",
-    "ChunkGatedDeltaRuleFusedFunction",
     "ChunkGatedDeltaRuleFunction",
+    "ChunkGatedDeltaRuleHybridFunction",
     "PackedParams",
     "ascendc_causal_conv1d",
     "ascendc_chunk_gated_delta_rule",
@@ -194,21 +194,22 @@ def ascendc_chunk_gated_delta_rule(
                 int(item) for item in cu_seqlens.detach().cpu().tolist()
             ]
 
-    # Fused pair only -- no fallback. The fused backward consumes the
-    # g_cumsum/A exports only the fused forward produces, so any other
-    # granularity is unsupported by design. Shapes outside the K=V=128 /
-    # chunk_size=64 envelope (e.g. V=256) or an install lacking the
-    # npu_chunk_gated_delta_rule_fwd/bwd pair (fla-npu < 26.10.0 or a
-    # mis-anchored wheel) raise instead of running the composed chain.
-    # ``save_backward_intermediates`` is a composed-chain-only flag and is
-    # rejected here along with it.
+    # Hybrid only -- no fallback. This branch targets fla-npu 26.9.1, where
+    # the fused forward ships a 910_93 kernel but the fused backward aclnn is
+    # Ascend950-only: the wrapper runs the fused forward and the composed
+    # backward chain, and shapes outside the K=V=128 / chunk_size=64
+    # envelope (e.g. V=256) or an install lacking
+    # npu_chunk_gated_delta_rule_fwd raise instead of running the fully
+    # composed chain. ``save_backward_intermediates`` is a composed
+    # forward-chain-only flag and the hybrid forward is fused, so it is
+    # rejected here.
     if save_backward_intermediates:
         raise ValueError(
-            "save_backward_intermediates is a composed-chain-only option "
-            "and the composed chain is no longer dispatched here; the "
-            "fused pair needs no saved recomputables."
+            "save_backward_intermediates is a composed forward-chain-only "
+            "option and the hybrid path forwards through the fused kernel; "
+            "the backward recomputes its intermediates itself."
         )
-    o, final_state = ChunkGatedDeltaRuleFusedFunction.apply(
+    o, final_state = ChunkGatedDeltaRuleHybridFunction.apply(
         q,
         k,
         v,

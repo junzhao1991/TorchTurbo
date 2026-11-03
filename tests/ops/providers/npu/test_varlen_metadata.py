@@ -61,7 +61,7 @@ def test_gdr_consumes_packed_params_directly(monkeypatch):
         return args[0].transpose(1, 2).contiguous(), None
 
     monkeypatch.setattr(
-        gdn.ChunkGatedDeltaRuleFusedFunction, "apply", fake_apply
+        gdn.ChunkGatedDeltaRuleHybridFunction, "apply", fake_apply
     )
     q = torch.randn(1, 3, 1, 128)
     packed = build_packed_params(torch.tensor([0, 3], dtype=torch.int32))
@@ -83,8 +83,9 @@ def test_gdr_consumes_packed_params_directly(monkeypatch):
 
 
 def test_gdr_rejects_composed_chain_only_options(monkeypatch):
-    """save_backward_intermediates served the composed chain, which the
-    wrapper no longer dispatches to; the flag is rejected up front."""
+    """save_backward_intermediates served the composed forward chain, which
+    the hybrid path (fused forward) no longer uses; the flag is rejected
+    up front."""
     gdn = _gdn_module()
     calls = []
 
@@ -93,7 +94,7 @@ def test_gdr_rejects_composed_chain_only_options(monkeypatch):
         return args[0].transpose(1, 2).contiguous(), None
 
     monkeypatch.setattr(
-        gdn.ChunkGatedDeltaRuleFusedFunction, "apply", fake_apply
+        gdn.ChunkGatedDeltaRuleHybridFunction, "apply", fake_apply
     )
     q = torch.randn(1, 3, 1, 128)
     inputs = (

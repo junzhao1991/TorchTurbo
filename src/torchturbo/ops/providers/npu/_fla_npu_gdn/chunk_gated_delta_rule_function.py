@@ -1,6 +1,6 @@
 """Autograd adapters for the AscendC chunk gated-delta-rule kernels.
 
-Two ``apply`` entry points share this module; both take head-first
+Three ``apply`` entry points share this module; all take head-first
 ``q/k [B,Hk,T,K]``, ``v [B,Hv,T,V]``, BSN ``g/beta [B,T,Hv]`` and return
 sequence-major ``o [B,T,Hv,V]``:
 
@@ -9,17 +9,18 @@ sequence-major ``o [B,T,Hv,V]``:
   implements the full forward and backward chains, including GVA head
   reduction, and supports ``initial_state`` as a constant forward input.
 * :class:`ChunkGatedDeltaRuleFusedFunction` -- the fused
-  ``npu_chunk_gated_delta_rule_fwd``/``bwd`` pair (fla-npu >= 26.10.0),
-  used when both directions run on the fused kernels. The q/k l2norm stays
-  outside the fused pair (the in-kernel export is an A5-only path), so
-  gradient post-processing matches the composed adapter.
+  ``npu_chunk_gated_delta_rule_fwd``/``bwd`` pair (fla-npu 26.10.0). Kept
+  on this 26.9.1-branch for reference but not dispatched: 26.9.1's fused
+  backward aclnn is Ascend950-only.
+* :class:`ChunkGatedDeltaRuleHybridFunction` -- **the 26.9.1 dispatch
+  target**: the fused forward (which 26.9.1 ships for 910_93) with the
+  composed backward chain. The q/k l2norm stays outside the kernels (the
+  in-kernel export is an A5-only path), so gradient post-processing matches
+  the composed adapter.
 
-Mixed granularity (fused forward with composed backward, or vice versa) is
-not supported: the fused backward consumes the ``g_cumsum``/``A`` exports
-only the fused forward produces. The GDN wrapper targets the fused pair
-exclusively; shapes outside its K=V=128 / chunk_size=64 envelope, or an
-install without the pair (fla-npu < 26.10.0), raise instead of falling back
-to the composed chain. Neither adapter implements initial-state or
+The GDN wrapper targets the hybrid path exclusively on this branch; shapes
+outside its K=V=128 / chunk_size=64 envelope raise instead of falling back
+to the fully composed chain. Neither adapter implements initial-state or
 final-state gradients.
 """
 
@@ -976,31 +977,38 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
 
 
 __all__ = [
-    "ChunkGatedDeltaRuleFusedFunction",
     "ChunkGatedDeltaRuleFunction",
+    "ChunkGatedDeltaRuleFusedFunction",
+    "ChunkGatedDeltaRuleHybridFunction",
 ]
 
 
 # ---------------------------------------------------------------------------
-# Large-fusion path (fwd+bwd both on the fused AscendC kernels)
+# 26.9.1 hybrid path (fused AscendC forward + composed backward chain)
 # ---------------------------------------------------------------------------
 #
-# The fused kernels are strictly narrower than the composed chain: the
-# envelope is K=V=128 with chunk_size=64, and both directions must come from
-# the same fused pair -- the fused backward consumes the ``g_cumsum``/``A``
-# only the fused forward exports, so a fused forward with a composed backward
-# is not a supported combination. The GDN path targets the fused pair
-# exclusively (fla-npu >= 26.10.0): any shape or install outside that
-# envelope is rejected with an error rather than falling back to the
-# composed chain.
+# This branch targets fla-npu 26.9.1 exclusively. In that wheel the fused
+# forward ships a 910_93 kernel, but the fused backward aclnn
+# (``aclnnChunkGatedDeltaRuleBwd``) is Ascend950-only: on A3 the backward
+# dies with ``GetWorkspaceSize failed: 161002`` (observed on the
+# 1103-1421 run; 26.10.0 is the wheel that lands the arch22 backward).
+# ``ChunkGatedDeltaRuleHybridFunction`` therefore runs the fused forward and
+# reuses the composed small-operator chain (``_backward_chain``) for the
+# backward. ``ChunkGatedDeltaRuleFusedFunction`` (26.10.0's both-directions
+# pair) is kept un-dispatched for reference.
+#
+# The fused kernel envelope is strictly narrower than the composed chain:
+# K=V=128 with chunk_size=64. Any shape outside it is rejected with an
+# error rather than falling back to the fully composed chain.
 
 _FUSED_KEY_DIM = 128
 _FUSED_VALUE_DIM = 128
 _FUSED_CHUNK_SIZE = 64
 
-# The fused pair is a hard dependency of this path: it ships in the
-# fla-npu 26.10.0 wheel, so it is imported directly like the composed-chain
-# ops. A missing pair surfaces as an ImportError at module import time.
+# The fused forward is a hard dependency of this path and ships in the
+# fla-npu 26.9.1 wheel; the fused backward import stays for the
+# (undispatched) 26.10.0 pair class below, and a missing surface shows up
+# as an ImportError at module import time.
 from fla_npu.ops.ascendc import (  # noqa: E402
     npu_chunk_gated_delta_rule_bwd as _fused_bwd,
     npu_chunk_gated_delta_rule_fwd as _fused_fwd,
@@ -1011,20 +1019,20 @@ from fla_npu.ops.ascendc import (  # noqa: E402
 # ``get_logger`` builds a fresh instance per call -- so the logger (and the
 # message, which reads the wheel version once) must be cached at module
 # level or the announcement would repeat on every GDN call.
-_fused_dispatch_logger = None
-_fused_dispatch_message = None
+_dispatch_logger = None
+_dispatch_message = None
 
 
-def _log_fused_dispatch_once() -> None:
-    """Announce the fused dispatch once per rank-0 process.
+def _log_gdn_dispatch_once() -> None:
+    """Announce the GDN dispatch once per rank-0 process.
 
     The dispatcher table prints the provider (``ascendc_gated_delta_rule``)
-    for both the composed chain and the fused pair under the same name, so
-    without this line the only way to tell the two apart from a job log is
-    indirect (absence of a fallback warning).
+    for the composed chain, the hybrid and the fused pair under the same
+    name, so without this line the only way to tell them apart from a job
+    log is indirect (absence of a fallback warning).
     """
-    global _fused_dispatch_logger, _fused_dispatch_message
-    if _fused_dispatch_logger is None:
+    global _dispatch_logger, _dispatch_message
+    if _dispatch_logger is None:
         try:
             import importlib.metadata as md
 
@@ -1033,12 +1041,13 @@ def _log_fused_dispatch_once() -> None:
             version = "unknown"
         from torchturbo.logging import get_logger
 
-        _fused_dispatch_logger = get_logger(__name__)
-        _fused_dispatch_message = (
-            "GDN dispatch: fused pair selected "
-            f"(npu_chunk_gated_delta_rule_fwd/bwd, fla-npu-a3 {version})"
+        _dispatch_logger = get_logger(__name__)
+        _dispatch_message = (
+            "GDN dispatch: hybrid selected "
+            "(fwd npu_chunk_gated_delta_rule_fwd + composed bwd chain, "
+            f"fla-npu-a3 {version})"
         )
-    _fused_dispatch_logger.info_rank0_once(_fused_dispatch_message)
+    _dispatch_logger.info_rank0_once(_dispatch_message)
 
 
 def _require_fused_envelope(
@@ -1107,7 +1116,9 @@ class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
             chunk_size,
         )
         _require_fused_envelope(key_dim, value_dim, chunk_size)
-        _log_fused_dispatch_once()
+        # Unreachable on this branch: the wrapper dispatches 26.9.1 to the
+        # hybrid adapter below. Kept (unlogged) for the 26.10.0 branch to
+        # cherry-pick from.
 
         (
             cu_seqlens,
@@ -1284,6 +1295,260 @@ class ChunkGatedDeltaRuleFusedFunction(torch.autograd.Function):
             dv.to(v.dtype),
             d_g.to(g_cumsum.dtype),
             d_beta.to(beta.dtype),
+            None,  # scale
+            None,  # initial_state gradient (rejected in forward)
+            None,  # output_final_state
+            None,
+            None,
+            None,
+            None,
+            None,  # use_qk_l2norm_in_kernel
+            None,  # chunk_size
+        )
+
+
+class ChunkGatedDeltaRuleHybridFunction(torch.autograd.Function):
+    """Autograd binding with the fused forward and the composed backward.
+
+    Targeted at fla-npu 26.9.x, whose fused backward aclnn is
+    Ascend950-only (A3 hits ``GetWorkspaceSize`` error 161002) while the
+    fused forward ships a 910_93 kernel. The forward reuses
+    ``ChunkGatedDeltaRuleFusedFunction``'s launch verbatim; the backward
+    reuses the composed ``_backward_chain`` (the small-operator path the
+    composed baseline validated) fed with the fused forward's exported
+    ``A`` and a locally recomputed ``g`` cumsum.
+
+    ``apply`` keeps the same 14-argument signature as the fused adapter:
+
+    q, k, v, g, beta, scale, initial_state, output_final_state,
+    cu_seqlens, cu_seqlens_list, chunk_indices, chunk_indices_list,
+    use_qk_l2norm_in_kernel, chunk_size.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        scale: float,
+        initial_state: Optional[torch.Tensor],
+        output_final_state: bool,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        cu_seqlens_list: Optional[list[int]] = None,
+        chunk_indices: Optional[TensorIndexDict | torch.Tensor] = None,
+        chunk_indices_list: Optional[
+            ListIndexDict | list[int] | tuple[int, ...] | torch.Tensor
+        ] = None,
+        use_qk_l2norm_in_kernel: bool = False,
+        chunk_size: int = _FUSED_CHUNK_SIZE,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        (
+            batch,
+            _key_heads,
+            _value_heads,
+            tokens,
+            key_dim,
+            value_dim,
+        ) = _validate_forward_inputs(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            scale,
+            initial_state,
+            output_final_state,
+            use_qk_l2norm_in_kernel,
+            chunk_size,
+        )
+        _require_fused_envelope(key_dim, value_dim, chunk_size)
+        _log_gdn_dispatch_once()
+
+        (
+            cu_seqlens,
+            cu_seqlens_list,
+            chunk_indices,
+            chunk_indices_list,
+        ) = _normalize_varlen_metadata(
+            g=g,
+            total_tokens=tokens,
+            batch=batch,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_list=cu_seqlens_list,
+            chunk_indices=chunk_indices,
+            chunk_indices_list=chunk_indices_list,
+        )
+        expected_states = (
+            len(cu_seqlens_list) - 1
+            if cu_seqlens_list is not None
+            else batch
+        )
+        if initial_state is not None and initial_state.shape[0] != expected_states:
+            raise ValueError(
+                "initial_state sequence dimension does not match the input, "
+                f"expected={expected_states}, got={initial_state.shape[0]}"
+            )
+        if initial_state is not None and ctx.needs_input_grad[6]:
+            # The composed backward chain has no state gradient either; the
+            # fused kernel does not need one for the SFT path.
+            raise NotImplementedError(
+                "initial_state.requires_grad=True is unsupported by this "
+                "adapter. Pass a detached initial_state."
+            )
+
+        q = q.contiguous()
+        k = k.contiguous()
+        v = v.contiguous()
+        g = g.contiguous()
+        beta = beta.contiguous()
+        main_dtype = q.dtype
+        if initial_state is not None:
+            initial_state = initial_state.contiguous()
+        if use_qk_l2norm_in_kernel:
+            q, q_rstd = l2norm_fwd(q)
+            k, k_rstd = l2norm_fwd(k)
+        else:
+            q_rstd = None
+            k_rstd = None
+
+        chunk_list = _chunk_list(chunk_indices_list, chunk_size)
+        (
+            o,
+            final_state,
+            g_cumsum,
+            A,
+            _beta_eff,
+            _h,
+            _q_hat,
+            _k_hat,
+            _q_rstd,
+            _k_rstd,
+        ) = _fused_fwd(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            chunk_size=chunk_size,
+            cu_seqlens=cu_seqlens_list,
+            chunk_indices=chunk_list,
+            scale=float(scale),
+            disable_recompute=True,
+            return_intermediate_states=False,
+            state_v_first=False,
+        )
+        # The composed backward chain consumes the same intermediates the
+        # composed forward produces: a bf16 chunk-local g cumsum (the fused
+        # export is fp32) and the head-major A, both of [B, Hv, T, 64] /
+        # [B, Hv, T] semantics identical to _forward_chain's (the fused and
+        # composed forward paths were verified digit-for-digit equal on the
+        # 1103-0600 run). The cumsum is recomputed from the saved raw g
+        # rather than cast from the fused fp32 export so the backward input
+        # dtypes match the composed baseline exactly; A from the fused
+        # forward is already the head-major [B, Hv, T, 64] bf16 layout the
+        # chain expects, so it is transited as-is.
+        ctx.save_for_backward(
+            q, k, v, g, beta, A, initial_state, q_rstd, k_rstd
+        )
+        ctx.has_l2norm = use_qk_l2norm_in_kernel
+        ctx.scale = float(scale)
+        ctx.chunk_size = chunk_size
+        ctx.cu_seqlens = cu_seqlens
+        ctx.cu_seqlens_list = cu_seqlens_list
+        ctx.chunk_indices = chunk_indices
+        ctx.chunk_indices_list = chunk_indices_list
+        ctx.set_materialize_grads(False)
+
+        # o comes out sequence-major [B, T, Hv, V]; the wrapper transposes.
+        del g_cumsum, _beta_eff, _h, _q_hat, _k_hat, _q_rstd, _k_rstd
+        if not output_final_state:
+            final_state = None
+        return o.to(main_dtype), final_state
+
+    @staticmethod
+    def backward(
+        ctx,
+        do: Optional[torch.Tensor],
+        dht: Optional[torch.Tensor],
+    ):
+        # The composed backward chain has no path through final_state
+        # either; a real gradient means the caller's loss depends on it and
+        # cannot be served here.
+        if dht is not None and bool(dht.any()):
+            raise RuntimeError(
+                "ascendc_chunk_gated_delta_rule: got a non-zero gradient "
+                "for final_state; the composed backward does not support "
+                "gradients w.r.t. it."
+            )
+        if do is None:
+            # Nothing differentiates through o; no input gradient is owed.
+            return (None,) * 14
+
+        (
+            q,
+            k,
+            v,
+            g_raw,
+            beta,
+            A,
+            initial_state,
+            q_rstd,
+            k_rstd,
+        ) = ctx.saved_tensors
+        # _backward_chain expects the same [B, T, Hv, V] sequence-major do
+        # the composed adapter receives.
+        do = do.contiguous()
+
+        cumulative_g = chunk_local_cumsum(
+            g_raw,
+            chunk_size=ctx.chunk_size,
+            cu_seqlens=ctx.cu_seqlens,
+            chunk_indices_out=ctx.chunk_indices,
+            head_first=False,
+        )
+        dq, dk, dv, dg, dbeta, _dh0 = _backward_chain(
+            q=q,
+            k=k,
+            v=v,
+            cumulative_g=cumulative_g,
+            beta=beta,
+            A_head=A,
+            scale=ctx.scale,
+            initial_state=initial_state,
+            do=do,
+            dht=None,
+            cu_seqlens=ctx.cu_seqlens,
+            cu_seqlens_list=ctx.cu_seqlens_list,
+            chunk_indices=ctx.chunk_indices,
+            chunk_indices_list=ctx.chunk_indices_list,
+            chunk_size=ctx.chunk_size,
+            # The composed baseline never saved recomputables on the default
+            # path; keep that so the chain recomputes w/u/h/v_new itself.
+            saved_w=None,
+            saved_u=None,
+            saved_h=None,
+            saved_v_new=None,
+        )
+        if ctx.has_l2norm:
+            assert q_rstd is not None and k_rstd is not None
+            dq = l2norm_bwd(q, q_rstd, dq)
+            dk = l2norm_bwd(k, k_rstd, dk)
+        # The order must match all 14 forward inputs exactly:
+        # q, k, v, g, beta, scale, initial_state, output_final_state,
+        # cu_seqlens, cu_seqlens_list, chunk_indices, chunk_indices_list,
+        # use_qk_l2norm_in_kernel, chunk_size.
+        return (
+            dq.to(q.dtype),
+            dk.to(k.dtype),
+            dv.to(v.dtype),
+            dg.to(g_raw.dtype),
+            dbeta.to(beta.dtype),
             None,  # scale
             None,  # initial_state gradient (rejected in forward)
             None,  # output_final_state
