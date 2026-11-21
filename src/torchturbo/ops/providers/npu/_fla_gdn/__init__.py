@@ -1,12 +1,15 @@
 """AscendC conv1d / gated-delta-rule backends for the Qwen3.5 linear-attention layer.
 
-This package vendors the two verified autograd adapters from the
+This package vendors the verified autograd adapters from the
 ``nachuan-flash-linear-attention-npu`` (fla-npu) example suite:
 
 * :class:`AscendCCausalConv1dFunction` — AscendC causal short-conv1d.
-* :class:`ChunkGatedDeltaRuleFunction` — AscendC chunk gated-delta-rule chain.
+* :class:`ChunkGatedDeltaRuleFusedFunction` -- fused AscendC chunk
+  gated-delta-rule forward/backward pair (the dispatched GDN path).
+* :class:`ChunkGatedDeltaRuleFunction` -- composed AscendC chunk
+  gated-delta-rule chain (numerical baseline for that pair).
 
-The two ``apply`` functions are the verified entry points, but their signatures
+The ``apply`` functions are the verified entry points, but their signatures
 and tensor layouts differ from the ``fla`` (theta-fla triton-ascend) functions
 that ``modeling_qwen3_5_moe.py`` / ``model.py`` currently call. To switch the
 Qwen3.5 linear-attention path to AscendC *without* rewriting the model code, we
@@ -40,10 +43,14 @@ import torch
 from torchturbo.ops.packed_params import PackedParams
 
 from .ascendc_causal_conv1d_function import AscendCCausalConv1dFunction
-from .chunk_gated_delta_rule_function import ChunkGatedDeltaRuleFunction
+from .chunk_gated_delta_rule_function import (
+    ChunkGatedDeltaRuleFusedFunction,
+    ChunkGatedDeltaRuleFunction,
+)
 
 __all__ = [
     "AscendCCausalConv1dFunction",
+    "ChunkGatedDeltaRuleFusedFunction",
     "ChunkGatedDeltaRuleFunction",
     "PackedParams",
     "ascendc_causal_conv1d",
@@ -159,6 +166,12 @@ def ascendc_chunk_gated_delta_rule(
     AscendC adapter expects head-first ``q/k/v`` (``[B, H, T, D]``), so we
     transpose on the way in. ``scale`` defaults to ``dk ** -0.5`` exactly like
     ``fla`` / the verified ``DemoGatedDeltaNet`` reference.
+
+    Both directions run on the fused ``npu_chunk_gated_delta_rule_fwd/bwd``
+    pair. That pair covers K=V=128 with chunk_size=64; other shapes raise
+    instead of falling back to the composed chain. ``initial_state`` is
+    accepted as a constant forward input, but neither initial-state nor
+    final-state gradients are supported.
     """
     if q.ndim != 4:
         raise ValueError(f"q/k/v must be [B, T, H, D], got q.shape={tuple(q.shape)}")
@@ -191,7 +204,21 @@ def ascendc_chunk_gated_delta_rule(
                 int(item) for item in cu_seqlens.detach().cpu().tolist()
             ]
 
-    o, final_state = ChunkGatedDeltaRuleFunction.apply(
+    # Fused pair only -- no fallback. The fused backward consumes the
+    # g_cumsum/A exports only the fused forward produces, so any other
+    # granularity is unsupported by design. Shapes outside the K=V=128 /
+    # chunk_size=64 envelope (e.g. V=256) or an install lacking the
+    # npu_chunk_gated_delta_rule_fwd/bwd pair (fla-npu < 26.10.0 or a
+    # mis-anchored wheel) raise instead of running the composed chain.
+    # ``save_backward_intermediates`` is a composed-chain-only flag and is
+    # rejected here along with it.
+    if save_backward_intermediates:
+        raise ValueError(
+            "save_backward_intermediates is a composed-chain-only option "
+            "and the composed chain is no longer dispatched here; the "
+            "fused pair needs no saved recomputables."
+        )
+    o, final_state = ChunkGatedDeltaRuleFusedFunction.apply(
         q,
         k,
         v,
@@ -206,7 +233,7 @@ def ascendc_chunk_gated_delta_rule(
         chunk_indices_list,
         use_qk_l2norm_in_kernel,
         chunk_size,
-        save_backward_intermediates,
     )
-    # o is already [B, T, H, V] (the adapter transposes back internally).
+    # o is already [B, T, H, V]: the composed adapter transposes back
+    # internally and the fused forward emits sequence-major directly.
     return o, final_state
