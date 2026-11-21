@@ -92,7 +92,8 @@ torchrun $DISTRIBUTED_ARGS $RUN_LF \
     --num_train_epochs 1 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 1 \
-    --eval_strategy no \
+    --max_steps 100 \
+    --tt_enable_chunk_loss true \
     --gradient_checkpointing \
     --lr_scheduler_type cosine \
     --logging_steps 1 \
