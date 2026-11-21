@@ -1,0 +1,19 @@
+# GDN Triton A/B leg: force the GDN layer onto fla's Triton implementations.
+# The default lf_text_sft.yaml keeps the AscendC fused pair; this file is only
+# for the Triton comparison run.
+#
+# Expected dispatcher table:
+#   causal_conv1d      fla_causal_conv1d     native  0  overridden
+#   gated_delta_rule   fla_gated_delta_rule  native  0  overridden
+engine_config:
+  parallel_plan:
+    sp_size: 2
+    ep_size: 8
+  backend_config:
+    cpu_offload:
+      enabled: false
+
+  ops:
+    overrides:
+      gated_delta_rule: fla_gated_delta_rule
+      causal_conv1d: fla_causal_conv1d
