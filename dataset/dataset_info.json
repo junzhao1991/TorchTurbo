@@ -1,19 +1,4 @@
 {
-  "science": {
-    "hf_hub_url": "a-m-team/AM-Thinking-v1-Distilled",
-    "data_files": "science.jsonl",
-    "formatting": "sharegpt",
-    "columns": {
-      "messages": "conversations",
-      "system": "system"
-    },
-    "tags": {
-      "role_tag": "from",
-      "content_tag": "value",
-      "user_tag": "human",
-      "assistant_tag": "assistant"
-    }
-  },
   "llava_1k_zh": {
     "hf_hub_url": "BUAADreamer/llava-en-zh-2k",
     "subset": "zh",
@@ -52,6 +37,63 @@
     "columns": {
       "prompt": "question",
       "response": "answer"
+    }
+  },
+  "science": {
+    "file_name": "/mnt/sfs_turbo/torchturbo/datasets/am_think/science.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "conversations",
+      "system": "system"
+    },
+    "tags": {
+      "role_tag": "from",
+      "content_tag": "value",
+      "user_tag": "human",
+      "assistant_tag": "assistant"
+    }
+  },
+  "med_debug": {
+    "file_name": "/mnt/sfs_turbo/torchturbo/datasets/sampled_sft_data_count_151372_0630_fixed.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "system_tag": "system"
+    }
+  },
+  "security": {
+    "file_name": "/mnt/sfs_turbo/torchturbo/datasets/xg/data_output_full.jsonl",
+    "columns": {
+      "prompt": "text",
+      "images": "image"
+    }
+  },
+  "sectask": {
+    "file_name": "/mnt/sfs_turbo/torchturbo/datasets/sllmworks_train.jsonl",
+    "columns": {
+      "prompt": "instruction",
+      "query": "input",
+      "response": "output"
+    }
+  },
+  "gsm8k_bd": {
+    "file_name": "/mnt/sfs_turbo/torchturbo/datasets/gsm8k/gsm8k_jsonl/gsm8k_train.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant"
     }
   }
 }
